@@ -1,0 +1,41 @@
+name: Diagnose kernel build
+
+on:
+  push:
+    paths:
+      - .github/workflows/diagnose-kernel-build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Inspect the original failed build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          repo = os.environ['GITHUB_REPOSITORY']
+          def api(path):
+              return json.loads(subprocess.run(['gh', 'api', f'repos/{repo}/{path}'], check=True, capture_output=True, text=True).stdout)
+          def annotation(title, text):
+              text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print(f'::notice title={title}::{text}')
+          superseded = api('actions/runs/38790095370')
+          if superseded['name'] == 'Build system tests' and superseded['head_sha'].startswith('20ab54a') and superseded['status'] != 'completed':
+              result = subprocess.run(['gh', 'api', '--method', 'POST', f'repos/{repo}/actions/runs/38790095370/cancel'], capture_output=True, text=True)
+              annotation('Superseded validation', f'Cancellation requested; exit={result.returncode}')
+          jobs = api('actions/runs/38780891459/jobs?per_page=100')['jobs']
+          selected = [job for job in jobs if 'android14, 6.1, 124' in job['name']]
+          if not selected:
+              raise SystemExit('Original representative job was not found')
+          for job in selected:
+              logs = subprocess.run(['gh', 'api', f'repos/{repo}/actions/jobs/{job["id"]}/logs'], check=True, capture_output=True).stdout.decode(errors='replace')
+              errors = [line for line in logs.splitlines() if re.search(r'error:|fatal:|ERROR:|ModuleNotFoundError|command not found', line)]
+              annotation('Original build failure', job['name'] + '\n' + '\n'.join(errors[:12])[-6000:])
+          PY

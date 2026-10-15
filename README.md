@@ -63,7 +63,10 @@ Actions 固定使用 Ubuntu 22.04，并安装旧版 AOSP 工具链需要的 ncur
 
 构建失败会立即停止，产物必须真实存在且非空。Bazel 构建会运行 dist 目标，
 将内核导出到 `out/<android>-<kernel>/dist`，再生成三种 AnyKernel3 ZIP。
-Stable 使用最新稳定标签，Dev 使用 `main`；指定 commit 时以该 commit 为准。
+Stable 使用带有 SUSFS 集成的 `builtin` 分支，Dev 使用 `dev`；指定 commit 时以该 commit 为准。
+普通 `main` / release 不一定包含 SUSFS，脚本会检查所选版本的 Kconfig，
+不支持 SUSFS 的版本会明确失败。当前 Dev 若未集成 SUSFS，请使用 Stable 或指定兼容 commit。
+构建完成后还会检查实际 `.config` 中的 KernelSU、SUSFS 和 KPM 选项，避免生成缺少功能的内核。
 CLI 与 Actions 使用同一份 `matrix.json`。
 
 `BOOT_SIGN_KEY` 是可选的 Actions Secret：未配置时仅生成 AnyKernel3 ZIP；

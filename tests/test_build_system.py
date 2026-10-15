@@ -105,14 +105,40 @@ class BuildSystemTests(unittest.TestCase):
         self.assertIn("goto bypass;", preprocessed)
 
     def test_stable_and_dev_select_supported_installer_revisions(self):
-        for version, expected in ((config.KSUVersion.STABLE.value, []),
-                                  (config.KSUVersion.DEV.value, ["main"])):
+        kconfig = self.builder.work_dir / "KernelSU/kernel/Kconfig"
+        kconfig.parent.mkdir(parents=True)
+        kconfig.write_text("config KSU_SUSFS\n\tbool\n")
+        for version, expected in ((config.KSUVersion.STABLE.value, ["builtin"]),
+                                  (config.KSUVersion.DEV.value, ["dev"])):
             with self.subTest(version=version):
                 self.config.kernelsu_version = version
                 with mock.patch.object(self.builder, "_run_cmd") as run:
                     self.builder.add_kernelsu()
                 args = shlex.split(run.call_args_list[-1].args[0])
                 self.assertEqual(args, ["bash", str(self.builder.work_dir / "kernelsu-setup.sh"), *expected])
+
+    def test_kernelsu_without_susfs_is_rejected(self):
+        kconfig = self.builder.work_dir / "KernelSU/kernel/Kconfig"
+        kconfig.parent.mkdir(parents=True)
+        kconfig.write_text("config KSU\n\ttristate\n")
+        with self.assertRaisesRegex(RuntimeError, "does not define KSU_SUSFS"):
+            self.builder.verify_kernelsu_definitions()
+
+    def test_generated_config_must_enable_required_features(self):
+        self.builder.dist_dir.mkdir(parents=True)
+        generated = self.builder.dist_dir / ".config"
+        generated.write_text("CONFIG_KSU=y\nCONFIG_KPM=y\n")
+        with self.assertRaisesRegex(RuntimeError, "CONFIG_KSU_SUSFS=y"):
+            self.builder.verify_kernel_features()
+        generated.write_text("CONFIG_KSU=y\nCONFIG_KSU_SUSFS=y\nCONFIG_KPM=y\n")
+        self.builder.verify_kernel_features()
+        self.config.use_kpm = False
+        with self.assertRaisesRegex(RuntimeError, "despite --no-kpm"):
+            self.builder.verify_kernel_features()
+
+    def test_missing_generated_config_is_not_a_successful_feature_check(self):
+        with self.assertRaisesRegex(RuntimeError, "Cannot locate"):
+            self.builder.verify_kernel_features()
 
     def test_cli_and_actions_use_the_same_matrix(self):
         configured = json.loads((SCRIPTS.parent / "config/matrix.json").read_text())

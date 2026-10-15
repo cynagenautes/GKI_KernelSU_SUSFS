@@ -263,19 +263,50 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         setup_path = self.work_dir / "kernelsu-setup.sh"
         self._run_cmd(f"curl --fail --location --show-error {shlex.quote(setup_url)} "
                       f"--output {shlex.quote(str(setup_path))}")
-        revision = self.config.kernelsu_commit
-        if not revision and self.config.kernelsu_version == KSUVersion.DEV.value:
-            revision = "main"
-        # No argument selects the latest stable tag in the upstream installer.
-        command = f"bash {shlex.quote(str(setup_path))}"
-        if revision:
-            command += f" {shlex.quote(revision)}"
+        # SUSFS is integrated on builtin, not on the ordinary main/release tree.
+        revision = self.config.kernelsu_commit or (
+            "dev" if self.config.kernelsu_version == KSUVersion.DEV.value else "builtin")
+        command = f"bash {shlex.quote(str(setup_path))} {shlex.quote(revision)}"
         self._run_cmd(command)
         if self.config.kernelsu_commit:
             ksu_dir = self.work_dir / "KernelSU"
             self._chdir(ksu_dir)
             self._run_cmd(f"git checkout --detach {shlex.quote(self.config.kernelsu_commit)}")
             self._chdir(self.work_dir)
+        self.verify_kernelsu_definitions()
+
+    def verify_kernelsu_definitions(self):
+        kconfig = self.work_dir / "KernelSU/kernel/Kconfig"
+        if not kconfig.is_file() or not re.search(r"^config KSU_SUSFS\s*$", kconfig.read_text(), re.MULTILINE):
+            raise RuntimeError("Selected KernelSU revision does not define KSU_SUSFS; "
+                               "use Stable (builtin) or pin a SUSFS-compatible KernelSU commit")
+
+    def verify_kernel_features(self):
+        candidates = [
+            self.dist_dir / ".config",
+            self.work_dir / "out" / f"{self.config.android_version}-{self.config.kernel_version}" / "common/.config",
+            self.work_dir / "bazel-bin/common/kernel_aarch64_config/.config",
+        ]
+        config_path = next((path for path in candidates if path.is_file()), None)
+        if config_path is None and (self.work_dir / "tools/bazel").exists():
+            self._chdir(self.work_dir)
+            result = self._run_cmd("tools/bazel cquery --config=fast --lto=thin --output=files "
+                                   "//common:kernel_aarch64_config", capture_output=True)
+            candidates.extend(self.work_dir / line.strip() for line in result.stdout.splitlines()
+                              if line.strip().endswith("/.config"))
+            config_path = next((path for path in candidates if path.is_file()), None)
+        if config_path is None:
+            raise RuntimeError("Cannot locate the generated kernel .config to verify KernelSU/SUSFS")
+        settings = set(config_path.read_text().splitlines())
+        required = ["CONFIG_KSU=y", "CONFIG_KSU_SUSFS=y"]
+        if self.config.use_kpm:
+            required.append("CONFIG_KPM=y")
+        missing = [option for option in required if option not in settings]
+        if missing:
+            raise RuntimeError("Built kernel is missing required features: " + ", ".join(missing))
+        if not self.config.use_kpm and "CONFIG_KPM=y" in settings:
+            raise RuntimeError("Built kernel enabled CONFIG_KPM despite --no-kpm")
+        logger.info("Verified built kernel features in %s: %s", config_path, ", ".join(required))
 
     def add_bbg(self):
         if not self.config.use_bbg:
@@ -819,6 +850,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             if not self.build_kernel():
                 return BuildResult(success=False, config=self.config, message="内核编译失败", build_time=time.time() - start_time)
 
+            self.verify_kernel_features()
             self.patch_kpm_image()
             artifacts = []
             artifacts.extend(self.prepare_boot_images())
