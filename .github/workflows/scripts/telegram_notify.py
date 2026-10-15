@@ -19,8 +19,6 @@ class TelegramNotifier:
         self.thread_id = thread_id or os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
 
         self.ssl_ctx = ssl.create_default_context()
-        self.ssl_ctx.check_hostname = False
-        self.ssl_ctx.verify_mode = ssl.CERT_NONE
 
     def send_message(self, message: str, parse_mode: str = "HTML", disable_web_page_preview: bool = True) -> bool:
         """发送消息到 Telegram"""

@@ -13,8 +13,6 @@ class ReleaseGenerator:
     def __init__(self):
         self.matrix_path = Path(__file__).parent.parent / "config" / "matrix.json"
         self.ssl_ctx = ssl.create_default_context()
-        self.ssl_ctx.check_hostname = False
-        self.ssl_ctx.verify_mode = ssl.CERT_NONE
 
     def load_matrix(self) -> dict:
         with open(self.matrix_path, 'r') as f:

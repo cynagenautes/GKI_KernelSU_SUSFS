@@ -9,8 +9,6 @@ import ssl
 def get_susfs_version() -> str:
     """从 susfs 仓库获取版本号"""
     ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
 
     # 尝试多个分支获取版本号
     branches = ["gki-android15-6.6", "gki-android14-6.1", "gki-android13-5.15", "gki-android12-5.10", "main"]
@@ -175,6 +173,7 @@ class BuildConfig:
             "os_patch_level": self.os_patch_level,
             "kernelsu_version": self.kernelsu_version,
             "kernelsu_commit": self.kernelsu_commit,
+            "susfs_commit": self.susfs_commit,
             "use_zram": self.use_zram,
             "use_kpm": self.use_kpm,
             "use_bbg": self.use_bbg,

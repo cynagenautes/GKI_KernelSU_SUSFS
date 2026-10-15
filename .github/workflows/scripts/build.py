@@ -19,36 +19,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEFAULT_BUILD_MATRIX = {
-    "android12-5.10": [
-        {"sub_level": "136", "os_patch_level": "2022-11", "revision": "r15"},
-        {"sub_level": "198", "os_patch_level": "2024-01", "revision": "r17"},
-        {"sub_level": "209", "os_patch_level": "2024-05", "revision": "r13"},
-        {"sub_level": "236", "os_patch_level": "2025-05", "revision": "r1"},
-        {"sub_level": "X", "os_patch_level": "lts", "revision": "r1"},
-    ],
-    "android13-5.15": [
-        {"sub_level": "74", "os_patch_level": "2023-01"},
-        {"sub_level": "123", "os_patch_level": "2023-11"},
-        {"sub_level": "148", "os_patch_level": "2024-05"},
-        {"sub_level": "170", "os_patch_level": "2025-01"},
-        {"sub_level": "178", "os_patch_level": "2025-03"},
-        {"sub_level": "180", "os_patch_level": "2025-05"},
-        {"sub_level": "189", "os_patch_level": "2025-09"},
-    ],
-    "android14-6.1": [
-        {"sub_level": "78", "os_patch_level": "2024-06"},
-        {"sub_level": "90", "os_patch_level": "2024-08"},
-        {"sub_level": "99", "os_patch_level": "2024-10"},
-        {"sub_level": "124", "os_patch_level": "2025-02"},
-        {"sub_level": "145", "os_patch_level": "2025-09"},
-    ],
-    "android15-6.6": [
-        {"sub_level": "50", "os_patch_level": "2024-10"},
-        {"sub_level": "66", "os_patch_level": "2025-02"},
-        {"sub_level": "102", "os_patch_level": "2025-10"},
-    ],
-}
+with (Path(__file__).parent.parent / "config" / "matrix.json").open() as matrix_file:
+    DEFAULT_BUILD_MATRIX = json.load(matrix_file)
 
 
 def parse_args() -> argparse.Namespace:
@@ -155,6 +127,7 @@ def build_matrix(matrix_key: str, args: argparse.Namespace, workspace: str) -> l
                 os_patch_level=cfg_data["os_patch_level"],
                 kernelsu_version=args.ksu_version,
                 kernelsu_commit=args.ksu_commit,
+                susfs_commit=args.susfs_commit,
                 use_zram=args.zram,
                 use_kpm=not args.no_kpm,
                 use_bbg=args.bbg,

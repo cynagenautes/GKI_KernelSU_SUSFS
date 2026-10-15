@@ -56,6 +56,26 @@ python build.py --list-configs
 python build.py --list-matrix
 ```
 
+本地需要安装 `ccache`、`bc`、`bison`、`flex`、`libssl-dev`、`libelf-dev`、
+`zip`、`unzip`、`lz4`、`pixz`、`rsync` 和 `cpio` 等内核构建工具。
+Actions 固定使用 Ubuntu 22.04，并安装旧版 AOSP 工具链需要的 ncurses/tinfo 兼容库。
+可用 `GKI_BUILD_JOBS` 限制并行数，用 `BAZEL_CACHE_DIR` 指定 Bazel 缓存目录。
+
+构建失败会立即停止，产物必须真实存在且非空。Bazel 构建会运行 dist 目标，
+将内核导出到 `out/<android>-<kernel>/dist`，再生成三种 AnyKernel3 ZIP。
+Stable 使用最新稳定标签，Dev 使用 `main`；指定 commit 时以该 commit 为准。
+CLI 与 Actions 使用同一份 `matrix.json`。
+
+`BOOT_SIGN_KEY` 是可选的 Actions Secret：未配置时仅生成 AnyKernel3 ZIP；
+配置时会验证私钥并签名 boot 镜像，签名失败会使构建失败。
+本地签名使用 `BOOT_SIGN_KEY_PATH` 指向私钥文件，勿将私钥提交到仓库。
+
+构建系统的离线回归测试（不编译内核、不发布产物）：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ---
 
 ## 构建矩阵

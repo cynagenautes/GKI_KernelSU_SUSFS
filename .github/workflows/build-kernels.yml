@@ -61,7 +61,7 @@ env:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     env:
       SCRIPTS_DIR: ./.github/workflows/scripts
     outputs:
@@ -84,7 +84,7 @@ jobs:
 
   build:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -114,17 +114,25 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt update && sudo apt upgrade -y
-          sudo apt install -y ccache python3 git curl wget zip unzip xz-utils openssl pixz
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev \
+            libncurses5 libtinfo5 ccache python3 git curl wget zip unzip xz-utils \
+            openssl pixz lz4 zstd rsync cpio
           pip install PyYAML
 
       - name: Setup AVB signing key
         env:
           BOOT_SIGN_KEY: ${{ secrets.BOOT_SIGN_KEY }}
         run: |
-          mkdir -p toolchain/linux-x86/bin
-          echo "$BOOT_SIGN_KEY" > toolchain/linux-x86/bin/testkey.pem
-          echo "BOOT_SIGN_KEY_PATH=$GITHUB_WORKSPACE/toolchain/linux-x86/bin/testkey.pem" >> $GITHUB_ENV
+          if [[ -n "$BOOT_SIGN_KEY" ]]; then
+            KEY_PATH="$RUNNER_TEMP/boot-sign-key.pem"
+            umask 077
+            printf '%s\n' "$BOOT_SIGN_KEY" > "$KEY_PATH"
+            openssl pkey -in "$KEY_PATH" -check -noout
+            echo "BOOT_SIGN_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+          else
+            echo "::notice::BOOT_SIGN_KEY is unset; only AnyKernel3 ZIPs will be generated."
+          fi
 
       - name: Configure ccache
         run: |
@@ -144,27 +152,37 @@ jobs:
           cache_bucket: ccache-cache
 
       - name: Build kernel
+        id: build-kernel
+        env:
+          ANDROID_VERSION: ${{ matrix.config.android }}
+          KERNEL_VERSION: ${{ matrix.config.kernel }}
+          SUB_LEVEL: ${{ matrix.config.sub_level }}
+          OS_PATCH: ${{ matrix.config.os_patch }}
+          REVISION: ${{ matrix.config.revision }}
+          KSU_VERSION: ${{ github.event.inputs.kernelsu_version }}
+          KSU_COMMIT: ${{ github.event.inputs.kernelsu_commit }}
+          SUSFS_COMMIT: ${{ github.event.inputs.susfs_commit }}
+          CUSTOM_VERSION: ${{ github.event.inputs.custom_version }}
+          USE_ZRAM: ${{ github.event.inputs.use_zram }}
+          USE_KPM: ${{ github.event.inputs.use_kpm }}
+          USE_BBG: ${{ github.event.inputs.BBG }}
         run: |
-          cd ${{ env.SCRIPTS_DIR }}
+          cd ./.github/workflows/scripts
+          ARGS=(--android "$ANDROID_VERSION" --kernel "$KERNEL_VERSION"
+                --sub-level "$SUB_LEVEL" --os-patch "$OS_PATCH"
+                --ksu-version "$KSU_VERSION" --no-release)
+          if [[ -n "$REVISION" ]]; then ARGS+=("--revision=$REVISION"); fi
+          if [[ "$USE_ZRAM" == true ]]; then ARGS+=(--zram); fi
+          if [[ "$USE_KPM" == false ]]; then ARGS+=(--no-kpm); fi
+          if [[ "$USE_BBG" == true ]]; then ARGS+=(--bbg); fi
+          if [[ -n "$KSU_COMMIT" ]]; then ARGS+=("--ksu-commit=$KSU_COMMIT"); fi
+          if [[ -n "$SUSFS_COMMIT" ]]; then ARGS+=("--susfs-commit=$SUSFS_COMMIT"); fi
+          if [[ -n "$CUSTOM_VERSION" ]]; then ARGS+=("--custom-version=$CUSTOM_VERSION"); fi
 
-          ARGS="--android ${{ matrix.config.android }}"
-          ARGS="$ARGS --kernel ${{ matrix.config.kernel }}"
-          ARGS="$ARGS --sub-level ${{ matrix.config.sub_level }}"
-          ARGS="$ARGS --os-patch ${{ matrix.config.os_patch }}"
-          [ -n "${{ matrix.config.revision }}" ] && ARGS="$ARGS --revision ${{ matrix.config.revision }}"
-          ARGS="$ARGS --ksu-version ${{ github.event.inputs.kernelsu_version }}"
-          ARGS="$ARGS --no-release"
-
-          [ "${{ github.event.inputs.use_zram }}" = "true" ] && ARGS="$ARGS --zram"
-          [ "${{ github.event.inputs.use_kpm }}" = "false" ] && ARGS="$ARGS --no-kpm"
-          [ "${{ github.event.inputs.BBG }}" = "true" ] && ARGS="$ARGS --bbg"
-          [ -z "${{ github.event.inputs.kernelsu_commit }}" ] || ARGS="$ARGS --ksu-commit=${{ github.event.inputs.kernelsu_commit }}"
-          [ -z "${{ github.event.inputs.susfs_commit }}" ] || ARGS="$ARGS --susfs-commit=${{ github.event.inputs.susfs_commit }}"
-          [ -z "${{ github.event.inputs.custom_version }}" ] || ARGS="$ARGS --custom-version=${{ github.event.inputs.custom_version }}"
-
-          python3 build.py $ARGS
+          python3 build.py "${ARGS[@]}"
 
       - name: Save ccache
+        continue-on-error: true
         uses: ./.github/actions/cache-save
         with:
           cache_path: /home/runner/.ccache
@@ -204,7 +222,7 @@ jobs:
             cp artifacts/SHA256SUMS.txt build-results/${{ matrix.config.android }}-${{ matrix.config.kernel }}-${{ matrix.config.sub_level }}.txt
           fi
           # 记录构建状态
-          echo "${{ matrix.config.android }}-${{ matrix.config.kernel }}-${{ matrix.config.sub_level }}:outcome=${{ job.status }}" >> build-results/status.txt
+          echo "${{ matrix.config.android }}-${{ matrix.config.kernel }}-${{ matrix.config.sub_level }}:outcome=${{ job.status }}" > build-results/status-${{ matrix.config.android }}-${{ matrix.config.kernel }}-${{ matrix.config.sub_level }}.txt
 
       - name: Upload build results
         uses: actions/upload-artifact@v7
@@ -215,8 +233,8 @@ jobs:
 
   release:
     needs: [prepare, build]
-    if: ${{ github.event.inputs.make_release == 'true' }}
-    runs-on: ubuntu-latest
+    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' && github.event.inputs.make_release == 'true' }}
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
     env:
@@ -250,9 +268,10 @@ jobs:
         run: |
           mkdir -p build-results
           echo "=== 构建摘要 ===" >> $GITHUB_STEP_SUMMARY
-          TOTAL=$(cat build-results/status.txt 2>/dev/null | wc -l || echo 0)
-          SUCCESS=$(grep ':outcome=success$' build-results/status.txt 2>/dev/null | wc -l || echo 0)
-          FAILED=$(grep ':outcome=failure$' build-results/status.txt 2>/dev/null | wc -l || echo 0)
+          find build-results -name 'status-*.txt' -type f -exec cat {} + > build-results/status.txt
+          TOTAL=$(awk 'END { print NR+0 }' build-results/status.txt)
+          SUCCESS=$(awk '/:outcome=success$/ { n++ } END { print n+0 }' build-results/status.txt)
+          FAILED=$(awk '/:outcome=failure$/ { n++ } END { print n+0 }' build-results/status.txt)
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
           echo "success=$SUCCESS" >> $GITHUB_OUTPUT
           echo "failed=$FAILED" >> $GITHUB_OUTPUT

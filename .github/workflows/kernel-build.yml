@@ -16,7 +16,7 @@ on:
           - android13
           - android14
           - android15
-        default: android13
+        default: android14
       kernel_version:
         description: 'Kernel 版本'
         required: true
@@ -26,7 +26,7 @@ on:
           - "5.15"
           - "6.1"
           - "6.6"
-        default: "5.15"
+        default: "6.1"
       sub_level:
         description: 'Sub Level 版本'
         required: true
@@ -106,7 +106,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Maximize build space
         uses: AdityaGarg8/remove-unwanted-software@v5
@@ -130,9 +130,25 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt update && sudo apt upgrade -y
-          sudo apt install -y ccache python3 git curl wget zip unzip
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev \
+            libncurses5 libtinfo5 ccache python3 git curl wget zip unzip xz-utils \
+            openssl pixz lz4 zstd rsync cpio
           pip install PyYAML
+
+      - name: Setup AVB signing key
+        env:
+          BOOT_SIGN_KEY: ${{ secrets.BOOT_SIGN_KEY }}
+        run: |
+          if [[ -n "$BOOT_SIGN_KEY" ]]; then
+            KEY_PATH="$RUNNER_TEMP/boot-sign-key.pem"
+            umask 077
+            printf '%s\n' "$BOOT_SIGN_KEY" > "$KEY_PATH"
+            openssl pkey -in "$KEY_PATH" -check -noout
+            echo "BOOT_SIGN_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+          else
+            echo "::notice::BOOT_SIGN_KEY is unset; only AnyKernel3 ZIPs will be generated."
+          fi
 
       - name: Configure ccache
         run: |
@@ -151,27 +167,38 @@ jobs:
             ${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}-${{ github.event.inputs.sub_level }}-ccache-
 
       - name: Build kernel
+        id: build-kernel
+        env:
+          ANDROID_VERSION: ${{ github.event.inputs.android_version }}
+          KERNEL_VERSION: ${{ github.event.inputs.kernel_version }}
+          SUB_LEVEL: ${{ github.event.inputs.sub_level }}
+          OS_PATCH: ${{ github.event.inputs.os_patch_level }}
+          REVISION: ${{ github.event.inputs.revision }}
+          KSU_VERSION: ${{ github.event.inputs.kernelsu_version }}
+          KSU_COMMIT: ${{ github.event.inputs.kernelsu_commit }}
+          SUSFS_COMMIT: ${{ github.event.inputs.susfs_commit }}
+          CUSTOM_VERSION: ${{ github.event.inputs.custom_version }}
+          USE_ZRAM: ${{ github.event.inputs.use_zram }}
+          USE_KPM: ${{ github.event.inputs.use_kpm }}
+          USE_BBG: ${{ github.event.inputs.BBG }}
+          SUPPORT_OP8E: ${{ github.event.inputs.supp_op }}
+          DEFAULT_BBR: ${{ github.event.inputs.set_defbbr }}
         run: |
           cd ./.github/workflows/scripts
+          ARGS=(--android "$ANDROID_VERSION" --kernel "$KERNEL_VERSION"
+                --sub-level "$SUB_LEVEL" --os-patch "$OS_PATCH"
+                --ksu-version "$KSU_VERSION" --no-release)
+          if [[ -n "$REVISION" ]]; then ARGS+=("--revision=$REVISION"); fi
+          if [[ "$USE_ZRAM" == true ]]; then ARGS+=(--zram); fi
+          if [[ "$USE_KPM" == false ]]; then ARGS+=(--no-kpm); fi
+          if [[ "$USE_BBG" == true ]]; then ARGS+=(--bbg); fi
+          if [[ -n "$KSU_COMMIT" ]]; then ARGS+=("--ksu-commit=$KSU_COMMIT"); fi
+          if [[ -n "$SUSFS_COMMIT" ]]; then ARGS+=("--susfs-commit=$SUSFS_COMMIT"); fi
+          if [[ -n "$CUSTOM_VERSION" ]]; then ARGS+=("--custom-version=$CUSTOM_VERSION"); fi
+          if [[ "$SUPPORT_OP8E" == true ]]; then ARGS+=(--op8e); fi
+          if [[ "$DEFAULT_BBR" == true ]]; then ARGS+=(--bbr); fi
 
-          ARGS="--android ${{ github.event.inputs.android_version }}"
-          ARGS="$ARGS --kernel ${{ github.event.inputs.kernel_version }}"
-          ARGS="$ARGS --sub-level ${{ github.event.inputs.sub_level }}"
-          ARGS="$ARGS --os-patch ${{ github.event.inputs.os_patch_level }}"
-          [ -n "${{ github.event.inputs.revision }}" ] && ARGS="$ARGS --revision ${{ github.event.inputs.revision }}"
-          ARGS="$ARGS --ksu-version ${{ github.event.inputs.kernelsu_version }}"
-
-          [ "${{ github.event.inputs.use_zram }}" = "true" ] && ARGS="$ARGS --zram"
-          [ "${{ github.event.inputs.use_kpm }}" = "false" ] && ARGS="$ARGS --no-kpm"
-          [ "${{ github.event.inputs.BBG }}" = "true" ] && ARGS="$ARGS --bbg"
-          [ "${{ github.event.inputs.supp_op }}" = "true" ] && ARGS="$ARGS --op8e"
-          [ "${{ github.event.inputs.set_defbbr }}" = "true" ] && ARGS="$ARGS --bbr"
-          [ -z "${{ github.event.inputs.kernelsu_commit }}" ] || ARGS="$ARGS --ksu-commit=${{ github.event.inputs.kernelsu_commit }}"
-          [ -z "${{ github.event.inputs.susfs_commit }}" ] || ARGS="$ARGS --susfs-commit=${{ github.event.inputs.susfs_commit }}"
-          [ -z "${{ github.event.inputs.custom_version }}" ] || ARGS="$ARGS --custom-version=${{ github.event.inputs.custom_version }}"
-          [ "${{ github.event.inputs.make_release }}" = "true" ] || ARGS="$ARGS --no-release"
-
-          python3 build.py $ARGS
+          python3 build.py "${ARGS[@]}"
 
       - name: Prepare artifacts
         run: |
@@ -207,4 +234,4 @@ jobs:
             "${{ github.event.inputs.kernelsu_version }}" \
             "${{ github.event.inputs.use_zram }}" \
             "${{ github.event.inputs.use_kpm }}" \
-            "../../SHA256SUMS.txt"
+            "$GITHUB_WORKSPACE/SHA256SUMS.txt"

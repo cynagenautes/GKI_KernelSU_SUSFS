@@ -2,11 +2,14 @@ import os
 import subprocess
 import logging
 import re
+import shlex
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional, Callable
 from dataclasses import dataclass, field
 
-from config import (BuildConfig, KSU_REPO_CONFIG, SUSFS_REPO_CONFIG, SUKISU_PATCH_REPO_CONFIG,
+from config import (BuildConfig, KSUVersion, KSU_REPO_CONFIG, SUSFS_REPO_CONFIG, SUKISU_PATCH_REPO_CONFIG,
                    ANYKERNEL_CONFIG, KERNEL_PATCHES_CONFIG, BBG_CONFIG, TOOLCHAIN_CONFIG,
                    LEGACY_FIXES, OP8E_PATCH_URL, KPM_PATCH_URL)
 
@@ -32,7 +35,10 @@ class ShellCommand:
             shell: bool = True, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
         logger.info(f"执行命令: {cmd}")
         try:
-            return subprocess.run(cmd, shell=shell, cwd=self.cwd, env=self.env,
+            if shell:
+                cmd = "set -o pipefail; " + cmd
+            return subprocess.run(cmd, shell=shell, executable="/bin/bash" if shell else None,
+                                cwd=self.cwd, env=self.env,
                                 capture_output=capture_output, text=True, timeout=timeout, check=check)
         except subprocess.CalledProcessError as e:
             logger.error(f"命令执行失败: {e.stderr or str(e)}")
@@ -43,7 +49,7 @@ class ShellCommand:
 
     def run_with_callback(self, cmd: str, callback: Optional[Callable] = None) -> str:
         logger.info(f"执行命令: {cmd}")
-        process = subprocess.Popen(cmd, shell=True, cwd=self.cwd, env=self.env,
+        process = subprocess.Popen(["/bin/bash", "-o", "pipefail", "-c", cmd], cwd=self.cwd, env=self.env,
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         output_lines = []
         for line in process.stdout:
@@ -102,8 +108,8 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
 
     def __init__(self, config: BuildConfig, workspace: str):
         self.config = config
-        self.workspace = Path(workspace)
-        self.shell = ShellCommand(cwd=workspace)
+        self.workspace = Path(workspace).resolve()
+        self.shell = ShellCommand(cwd=str(self.workspace))
         self.env = os.environ.copy()
         self.work_dir = self.workspace / config.config_name
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -113,6 +119,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         self.kernel_patches_dir = self.workspace / "kernel_patches"
         self.toolchain_dir = self.workspace / "toolchain"
         self.mkbootimg_dir = self.workspace / "mkbootimg"
+        self.dist_dir = self.work_dir / f"out/{config.android_version}-{config.kernel_version}/dist"
         self._setup_env()
 
     def _setup_env(self):
@@ -133,12 +140,8 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         if not self.config.susfs_commit or not self.susfs_dir.exists():
             return
         self._chdir(self.susfs_dir)
-        if self.config.susfs_commit.startswith("HEAD~"):
-            self._run_cmd("git fetch origin", check=False)
-            self._run_cmd(f"git reset --hard {self.config.susfs_commit}", check=False)
-        else:
-            self._run_cmd("git fetch origin", check=False)
-            self._run_cmd(f"git checkout {self.config.susfs_commit}", check=False)
+        self._run_cmd("git fetch origin")
+        self._run_cmd(f"git checkout --detach {shlex.quote(self.config.susfs_commit)}")
         self._chdir(self.workspace)
 
     def clone_repositories(self):
@@ -150,11 +153,11 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             ("Kernel Patches", self.kernel_patches_dir, KERNEL_PATCHES_CONFIG['repo_url'], None),
         ]:
             if not repo_dir.exists():
-                cmd = f"git clone {url}"
+                cmd = f"git clone {shlex.quote(url)} {shlex.quote(str(repo_dir))}"
                 if branch:
                     cmd += f" -b {branch}"
                 logger.info(f"克隆 {name}...")
-                self._run_cmd(cmd, check=False)
+                self._run_cmd(cmd)
             else:
                 logger.info(f"{name} 已存在，跳过")
         self._apply_susfs_commit()
@@ -164,10 +167,10 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         logger.info("=== 克隆工具链 ===")
         if not self.toolchain_dir.exists():
             self._run_cmd(f"git clone {TOOLCHAIN_CONFIG['aosp_mirror']}/kernel/prebuilts/build-tools "
-                         f"-b {TOOLCHAIN_CONFIG['build_tools_branch']} --depth 1 {self.toolchain_dir}", check=False)
+                         f"-b {TOOLCHAIN_CONFIG['build_tools_branch']} --depth 1 {shlex.quote(str(self.toolchain_dir))}")
         if not self.mkbootimg_dir.exists():
             self._run_cmd(f"git clone {TOOLCHAIN_CONFIG['aosp_mirror']}/platform/system/tools/mkbootimg "
-                         f"-b {TOOLCHAIN_CONFIG['mkbootimg_branch']} --depth 1 {self.mkbootimg_dir}", check=False)
+                         f"-b {TOOLCHAIN_CONFIG['mkbootimg_branch']} --depth 1 {shlex.quote(str(self.mkbootimg_dir))}")
         self.env["AVBTOOL"] = str(self.toolchain_dir / "linux-x86/bin/avbtool")
         self.env["MKBOOTIMG"] = str(self.mkbootimg_dir / "mkbootimg.py")
         self.env["UNPACK_BOOTIMG"] = str(self.mkbootimg_dir / "unpack_bootimg.py")
@@ -181,9 +184,15 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         repo_dir = self.workspace / "git-repo"
         repo_dir.mkdir(exist_ok=True)
         repo_path = repo_dir / "repo"
-        if not repo_path.exists():
-            self._run_cmd(f"curl https://storage.googleapis.com/git-repo-downloads/repo > {repo_path}", check=False)
-            self._run_cmd(f"chmod a+rx {repo_path}", check=False)
+        if not repo_path.exists() or repo_path.stat().st_size == 0:
+            download_path = repo_path.with_suffix(".download")
+            self._run_cmd("curl --fail --location --show-error "
+                          "https://storage.googleapis.com/git-repo-downloads/repo "
+                          f"--output {shlex.quote(str(download_path))}")
+            if download_path.stat().st_size == 0:
+                raise RuntimeError("Downloaded repo launcher is empty")
+            download_path.chmod(0o755)
+            download_path.replace(repo_path)
         self.env["REPO"] = str(repo_path)
         self.shell.env = self.env
 
@@ -192,11 +201,12 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         self._chdir(self.work_dir)
         formatted_branch = self.config.formatted_branch
 
-        self._run_cmd(f"$REPO init --depth=1 -u https://android.googlesource.com/kernel/manifest "
-                     f"-b common-{formatted_branch} --repo-rev=v2.16", check=False)
+        self._run_cmd(f'"$REPO" init --depth=1 -u https://android.googlesource.com/kernel/manifest '
+                     f"-b common-{formatted_branch} --repo-rev=v2.16")
 
-        remote = subprocess.run(f"git ls-remote https://android.googlesource.com/kernel/common {formatted_branch}",
-                               shell=True, capture_output=True, text=True).stdout.strip()
+        remote = self._run_cmd(
+            f"git ls-remote https://android.googlesource.com/kernel/common {formatted_branch}",
+            capture_output=True).stdout.strip()
         if "deprecated" in remote:
             manifest_path = self.work_dir / ".repo/manifests/default.xml"
             with open(manifest_path, "r") as f:
@@ -207,7 +217,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
 
         self.env["REMOTE_BRANCH"] = remote
         logger.info("同步内核源代码...")
-        self._run_cmd("$REPO --trace sync -c -j$(nproc --all) --no-tags --fail-fast", check=False)
+        self._run_cmd(f'"$REPO" --trace sync -c -j{self._build_jobs()} --no-tags --fail-fast')
 
         common_dir = self.work_dir / "common"
         if not common_dir.exists():
@@ -223,13 +233,13 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         if is_deprecated and av == "android13" and kv == "5.15" and sub and sub < 123:
             common_dir = self.work_dir / "common"
             self._chdir(common_dir)
-            self._run_cmd(f"curl -LSs {LEGACY_FIXES['android13-5.15-below-123']['url']} -o fix.patch && patch -p1 < fix.patch", check=False)
+            self._run_cmd(f"curl -LSs {LEGACY_FIXES['android13-5.15-below-123']['url']} -o fix.patch && patch -p1 < fix.patch")
             self._chdir(self.work_dir)
 
         if av == "android12" and kv == "5.10" and sub and sub < 136:
             common_dir = self.work_dir / "common"
             self._chdir(common_dir)
-            self._run_cmd(f"curl -LSs {LEGACY_FIXES['android12-5.10-below-136']['url']} | patch -p1", check=False)
+            self._run_cmd(f"curl -LSs {LEGACY_FIXES['android12-5.10-below-136']['url']} | patch -p1")
             self._chdir(self.work_dir)
 
     def add_kernel_supatch(self):
@@ -240,7 +250,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         if not drivers_dir.exists():
             return
         self._chdir(drivers_dir)
-        self._run_cmd(f"curl -LSs {OP8E_PATCH_URL} -o hmbird_patch.c", check=False)
+        self._run_cmd(f"curl -LSs {OP8E_PATCH_URL} -o hmbird_patch.c")
         if (drivers_dir / "hmbird_patch.c").exists():
             with open(drivers_dir / "Makefile", "a") as f:
                 f.write("obj-y += hmbird_patch.o\n")
@@ -250,13 +260,22 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         self._chdir(self.work_dir)
         setup_url = (f"https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/{self.config.kernelsu_commit}/kernel/setup.sh"
                     if self.config.kernelsu_commit else KSU_REPO_CONFIG["setup_script"])
-        self._run_cmd(f"curl -LSs {setup_url} | bash -s builtin", check=False)
+        setup_path = self.work_dir / "kernelsu-setup.sh"
+        self._run_cmd(f"curl --fail --location --show-error {shlex.quote(setup_url)} "
+                      f"--output {shlex.quote(str(setup_path))}")
+        revision = self.config.kernelsu_commit
+        if not revision and self.config.kernelsu_version == KSUVersion.DEV.value:
+            revision = "main"
+        # No argument selects the latest stable tag in the upstream installer.
+        command = f"bash {shlex.quote(str(setup_path))}"
+        if revision:
+            command += f" {shlex.quote(revision)}"
+        self._run_cmd(command)
         if self.config.kernelsu_commit:
             ksu_dir = self.work_dir / "KernelSU"
-            if ksu_dir.exists():
-                self._chdir(ksu_dir)
-                self._run_cmd(f"git checkout {self.config.kernelsu_commit}", check=False)
-                self._chdir(self.work_dir)
+            self._chdir(ksu_dir)
+            self._run_cmd(f"git checkout --detach {shlex.quote(self.config.kernelsu_commit)}")
+            self._chdir(self.work_dir)
 
     def add_bbg(self):
         if not self.config.use_bbg:
@@ -266,7 +285,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         if not common_dir.exists():
             return
         self._chdir(common_dir)
-        self._run_cmd(f"wget -O- {BBG_CONFIG['setup_script']} | bash", check=False)
+        self._run_cmd(f"wget -O- {BBG_CONFIG['setup_script']} | bash")
         config_file = common_dir / "arch/arm64/configs/gki_defconfig"
         if config_file.exists():
             with open(config_file, "a") as f:
@@ -286,19 +305,21 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         self._chdir(self.work_dir)
         common_dir = self.work_dir / "common"
         susfs_patch = self.susfs_dir / "kernel_patches" / self.config.get_susfs_patch_filename()
+        if not susfs_patch.is_file():
+            raise FileNotFoundError(f"Required SUSFS patch is missing: {susfs_patch}")
         if susfs_patch.exists():
-            self._run_cmd(f"cp {susfs_patch} {common_dir}/", check=False)
+            self._run_cmd(f"cp {susfs_patch} {common_dir}/")
         for src, dst in [
             (self.susfs_dir / "kernel_patches/fs", common_dir / "fs/"),
             (self.susfs_dir / "kernel_patches/include/linux", common_dir / "include/linux/"),
         ]:
             if src.exists():
-                self._run_cmd(f"cp -r {src}/* {dst}", check=False)
+                self._run_cmd(f"cp -r {src}/* {dst}")
         if susfs_patch.exists():
             patch_file = common_dir / self.config.get_susfs_patch_filename()
             if patch_file.exists():
                 self._chdir(common_dir)
-                self._run_cmd(f"patch -p1 --fuzz=3 < {patch_file}", check=False)
+                self._run_cmd(f"patch -p1 --fuzz=3 < {patch_file}")
                 self._chdir(self.work_dir)
 
     def apply_sukisu_patches(self):
@@ -306,7 +327,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         self._chdir(self.work_dir / "common")
         hooks_patch = self.sukisu_patch_dir / "69_hide_stuff.patch"
         if hooks_patch.exists():
-            self._run_cmd(f"cp {hooks_patch} . && patch -p1 -F 3 < 69_hide_stuff.patch", check=False)
+            self._run_cmd(f"cp {hooks_patch} . && patch -p1 -F 3 < 69_hide_stuff.patch")
 
     def apply_zram_patches(self):
         if not self.config.use_zram:
@@ -320,12 +341,12 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             (self.sukisu_patch_dir / "other/zram/lz4k_oplus", "lib/"),
         ]:
             if src[0].exists():
-                self._run_cmd(f"cp -r {src[0]}/* {src[1]}", check=False)
+                self._run_cmd(f"cp -r {src[0]}/* {src[1]}")
         zram_patch_dir = self.sukisu_patch_dir / f"other/zram/zram_patch/{self.config.kernel_version}"
         for patch in ["lz4kd.patch", "lz4k_oplus.patch"]:
             p = zram_patch_dir / patch
             if p.exists():
-                self._run_cmd(f"patch -p1 -F 3 < {p}", check=False)
+                self._run_cmd(f"patch -p1 -F 3 < {p}")
 
     def apply_task_mmu_fixes(self):
         logger.info("=== 应用 task_mmu.c 修复 ===")
@@ -410,7 +431,10 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             return
 
         with open(config_file, "a") as f:
-            f.write(self.KERNEL_CONFIG_TEMPLATE)
+            template = self.KERNEL_CONFIG_TEMPLATE
+            if not self.config.use_kpm:
+                template = template.replace("CONFIG_KPM=y", "CONFIG_KPM=n")
+            f.write(template)
             if self.config.kernel_version != "6.6":
                 f.write("CONFIG_KSU_SUSFS_SUS_PATH=y\n")
             else:
@@ -596,6 +620,12 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         
         logger.info("-" * 60)
 
+    def _build_jobs(self) -> int:
+        jobs = int(self.env.get("GKI_BUILD_JOBS", os.cpu_count() or 1))
+        if jobs < 1:
+            raise ValueError("GKI_BUILD_JOBS must be a positive integer")
+        return jobs
+
     def build_kernel(self) -> bool:
         logger.info("=== 开始编译内核 ===")
         self._chdir(self.work_dir)
@@ -612,10 +642,22 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         try:
             if (self.work_dir / "build/build.sh").exists():
                 logger.info("使用旧版构建方式...")
-                result = self._run_cmd("LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC=\"/usr/bin/ccache clang\"", check=False)
+                ccache = shutil.which("ccache")
+                if not ccache:
+                    raise RuntimeError("ccache is required for legacy kernel builds")
+                compiler = shlex.quote(f"{shlex.quote(ccache)} clang")
+                result = self._run_cmd("LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 "
+                                       f"build/build.sh CC={compiler} -j{self._build_jobs()}")
             else:
                 logger.info("使用 Bazel 构建方式...")
-                result = self._run_cmd("tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast --lto=thin //common:kernel_aarch64_dist", check=False)
+                cache_root = Path(self.env.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+                cache_dir = Path(self.env.get("BAZEL_CACHE_DIR", str(cache_root / "bazel")))
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                result = self._run_cmd(
+                    f"tools/bazel run --disk_cache={shlex.quote(str(cache_dir))} "
+                    f"--jobs={self._build_jobs()} --config=fast --lto=thin "
+                    "//common:kernel_aarch64_dist -- "
+                    f"--dist_dir={shlex.quote(str(self.dist_dir))}")
 
             if result.returncode == 0:
                 logger.info("=== 内核编译成功 ===")
@@ -632,17 +674,16 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         logger.info("=== 修补 Image 文件 (KPM) ===")
         self._chdir(self.work_dir)
 
-        if self.config.android_version in ["android12", "android13"]:
-            image_dir = self.work_dir / f"out/{self.config.android_version}-{self.config.kernel_version}/dist"
-        else:
-            image_dir = self.work_dir / "bazel-bin/common/kernel_aarch64"
+        image_dir = self.dist_dir
 
         if not image_dir.exists():
             return
         self._chdir(image_dir)
-        self._run_cmd(f"curl -LSs {KPM_PATCH_URL} -o patch && chmod 777 patch && ./patch", check=False)
-        if (image_dir / "oImage").exists():
-            self._run_cmd("mv oImage Image", check=False)
+        self._run_cmd(f"curl --fail --location --show-error {KPM_PATCH_URL} -o patch && chmod 755 patch && ./patch")
+        if (image_dir / "oImage").is_file():
+            self._run_cmd("mv oImage Image")
+            if (image_dir / "Image.lz4").exists():
+                self._run_cmd("lz4 -l -12 -f Image Image.lz4")
 
     def prepare_boot_images(self) -> list:
         logger.info("=== 准备启动镜像 ===")
@@ -651,18 +692,25 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         bootimgs_dir.mkdir(exist_ok=True)
         artifacts = []
 
-        if self.config.android_version in ["android12", "android13"]:
-            image_source = self.work_dir / f"out/{self.config.android_version}-{self.config.kernel_version}/dist"
-        else:
-            image_source = self.work_dir / "bazel-bin/common/kernel_aarch64"
+        image_source = self.dist_dir
+        if not (image_source / "Image").is_file() or (image_source / "Image").stat().st_size == 0:
+            raise RuntimeError(f"Kernel build did not produce a nonempty Image in {image_source}")
 
         for image_name in ["Image", "Image.lz4"]:
             src = image_source / image_name
             if src.exists():
-                self._run_cmd(f"cp {src} {bootimgs_dir}/ && cp {src} {self.work_dir}/", check=False)
+                shutil.copy2(src, bootimgs_dir / image_name)
+                shutil.copy2(src, self.work_dir / image_name)
 
         if (self.work_dir / "Image").exists():
-            self._run_cmd("gzip -n -k -f -9 Image", check=False)
+            self._run_cmd("gzip -n -k -f -9 Image")
+
+        key_path = self.env.get("BOOT_SIGN_KEY_PATH")
+        if not key_path:
+            logger.warning("BOOT_SIGN_KEY_PATH is unset; producing AnyKernel3 ZIPs only, skipping boot images")
+            return artifacts
+        if not Path(key_path).is_file() or Path(key_path).stat().st_size == 0:
+            raise RuntimeError("BOOT_SIGN_KEY_PATH must point to a nonempty signing key")
 
         if self.config.android_version == "android12":
             self._prepare_android12_boot_images(bootimgs_dir, artifacts)
@@ -676,10 +724,10 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         fallback_url = "https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-2023-01_r1.zip"
         result = subprocess.run(f"curl -sL -w '%{{http_code}}' {gki_url} -o /dev/null", shell=True, capture_output=True, text=True)
         url = gki_url if "200" in result.stdout else fallback_url
-        self._run_cmd(f"curl -Lo gki-kernel.zip {url} && unzip -o gki-kernel.zip && rm gki-kernel.zip", check=False)
+        self._run_cmd(f"curl -Lo gki-kernel.zip {url} && unzip -o gki-kernel.zip && rm gki-kernel.zip")
         boot_img_path = bootimgs_dir / "boot-5.10.img"
         if boot_img_path.exists():
-            self._run_cmd(f"$UNPACK_BOOTIMG --boot_img={boot_img_path}", check=False)
+            self._run_cmd(f'"$UNPACK_BOOTIMG" --boot_img={shlex.quote(str(boot_img_path))}')
         self._create_boot_image_variants(bootimgs_dir, artifacts, has_ramdisk=True)
 
     def _prepare_boot_images_generic(self, bootimgs_dir: Path, artifacts: list):
@@ -689,19 +737,19 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
     def _create_boot_image_variants(self, bootimgs_dir: Path, artifacts: list, has_ramdisk: bool = False):
         self._chdir(bootimgs_dir)
         if (bootimgs_dir / "Image").exists():
-            self._run_cmd("gzip -n -k -f -9 Image", check=False)
+            self._run_cmd("gzip -n -k -f -9 Image")
 
         for kernel_file, output_file in [("Image", "boot.img"), ("Image.gz", "boot-gz.img"), ("Image.lz4", "boot-lz4.img")]:
             kernel_path = bootimgs_dir / kernel_file
             if not kernel_path.exists():
                 continue
-            cmd = f"$MKBOOTIMG --header_version 4 --kernel {kernel_file} --output {output_file}"
+            cmd = f'"$MKBOOTIMG" --header_version 4 --kernel {kernel_file} --output {output_file}'
             if has_ramdisk:
                 cmd += f" --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level {self.config.os_patch_level}"
-            self._run_cmd(cmd, check=False)
-            self._run_cmd(f"$AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image {output_file} --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH", check=False)
+            self._run_cmd(cmd)
+            self._run_cmd(f'"$AVBTOOL" add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image {output_file} --algorithm SHA256_RSA2048 --key "$BOOT_SIGN_KEY_PATH"')
             dest = self.work_dir / f"{self.config.android_version}-{self.config.kernel_version}.{self.config.sub_level}-{self.config.os_patch_level}-{output_file}"
-            self._run_cmd(f"cp {output_file} {dest}", check=False)
+            shutil.copy2(output_file, dest)
             artifacts.append(str(dest))
 
     def create_anykernel_zips(self) -> list:
@@ -710,18 +758,27 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         artifacts = []
         ak3_dir = self.anykernel_dir
 
-        for suffix in ["", "-lz4", "-gz"]:
-            image_file = f"Image{suffix}"
+        for image_file, suffix in [("Image", ""), ("Image.lz4", "-lz4"), ("Image.gz", "-gz")]:
             image_path = self.work_dir / image_file
             if not image_path.exists():
                 continue
             zip_name = f"{self.config.android_version}-{self.config.kernel_version}.{self.config.sub_level}-{self.config.os_patch_level}-AnyKernel3{suffix}.zip"
-            self._run_cmd(f"cp {image_path} {ak3_dir}/", check=False)
-            self._chdir(ak3_dir)
-            self._run_cmd(f"zip -r ../{zip_name} ./*", check=False)
-            self._run_cmd(f"rm {ak3_dir}/{image_file}", check=False)
-            artifacts.append(str(self.work_dir / zip_name))
-            self._chdir(self.work_dir)
+            output_path = self.work_dir / zip_name
+            # Each variant must contain the filename expected by anykernel.sh.
+            # Stage a copy so shared templates and previous variants stay intact.
+            with tempfile.TemporaryDirectory(prefix="anykernel-", dir=self.workspace) as staging:
+                stage = Path(staging) / "AnyKernel3"
+                shutil.copytree(ak3_dir, stage, symlinks=True,
+                                ignore=shutil.ignore_patterns(".git", "Image", "Image.gz", "Image.lz4"))
+                shutil.copy2(image_path, stage / "Image")
+                self._chdir(stage)
+                try:
+                    if output_path.exists():
+                        output_path.unlink()
+                    self._run_cmd(f"zip -r {shlex.quote(str(output_path))} .")
+                finally:
+                    self._chdir(self.work_dir)
+            artifacts.append(str(output_path))
         return artifacts
 
     def build(self) -> BuildResult:
@@ -754,6 +811,11 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             artifacts = []
             artifacts.extend(self.prepare_boot_images())
             artifacts.extend(self.create_anykernel_zips())
+            if not artifacts:
+                raise RuntimeError("Build produced no artifacts")
+            for artifact in artifacts:
+                if not Path(artifact).is_file() or Path(artifact).stat().st_size == 0:
+                    raise RuntimeError(f"Build artifact is missing or empty: {artifact}")
 
             build_time = time.time() - start_time
             logger.info(f"构建成功! 耗时: {build_time:.2f} 秒, 生成 {len(artifacts)} 个产物")
