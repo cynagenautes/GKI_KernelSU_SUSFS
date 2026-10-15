@@ -76,6 +76,12 @@ CLI 与 Actions 使用同一份 `matrix.json`。
 python -m unittest discover -s tests -v
 ```
 
+Actions 的 **Build system tests** 默认只运行离线回归测试。
+需要验证实际内核编译时，可手动运行该工作流并启用 `kernel_smoke`，
+它会以两个并行任务编译 Android 14 / 6.1.124，并上传 AnyKernel3 ZIP，
+不会创建 Release 或发送 Telegram 通知。维护者也可在 push 的 commit
+消息中加入 `[kernel-smoke]` 来触发此检查。完整构建耗时明显高于回归测试。
+
 ---
 
 ## 构建矩阵
