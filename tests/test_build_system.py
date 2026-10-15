@@ -193,6 +193,20 @@ class WorkflowTests(unittest.TestCase):
     def load(self, name):
         return yaml.safe_load((ROOT / ".github/workflows" / name).read_text())
 
+    def test_kernel_smoke_preserves_python_failure_through_tee(self):
+        workflow = self.load("build-system-tests.yml")
+        step = next(step for step in workflow["jobs"]["kernel-smoke"]["steps"]
+                    if step.get("name") == "Compile and package Android 14 kernel")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            python = root / "python"
+            python.write_text("#!/bin/bash\nprintf 'build failure fixture\\n'\nexit 17\n")
+            python.chmod(0o755)
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"], "RUNNER_TEMP": str(root)}
+            result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=ROOT, env=env, capture_output=True)
+            self.assertEqual(result.returncode, 17)
+            self.assertIn("build failure fixture", (root / "kernel-build.log").read_text())
+
     def test_workflow_arguments_preserve_spaces_and_shell_characters(self):
         for name in ("kernel-build.yml", "build-kernels.yml"):
             with self.subTest(workflow=name), tempfile.TemporaryDirectory() as temp:

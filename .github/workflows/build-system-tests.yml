@@ -53,6 +53,7 @@ jobs:
           python -m pip install PyYAML
       - name: Compile and package Android 14 kernel
         run: |
+          set -euo pipefail
           python .github/workflows/scripts/build.py \
             --android android14 --kernel 6.1 --sub-level 124 --os-patch 2025-02 \
             --no-release --workspace /tmp/gki-smoke \
