@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import ssl
 import subprocess
 import sys
@@ -72,6 +73,36 @@ class BuildSystemTests(unittest.TestCase):
     def test_missing_susfs_patch_fails_instead_of_building_without_susfs(self):
         with self.assertRaisesRegex(FileNotFoundError, "SUSFS patch"):
             self.builder.apply_susfs_patches()
+
+    def test_combined_maps_patches_preserve_redirect_lock_scope(self):
+        fixtures = ROOT / "tests/fixtures/maps"
+        maps = self.builder.work_dir / "common/fs/proc/task_mmu.c"
+        maps.parent.mkdir(parents=True)
+        shutil.copy2(fixtures / "task_mmu.c", maps)
+        patch_contents = json.loads((fixtures / "patches.json").read_text())
+        patches = self.builder.susfs_dir / "kernel_patches"
+        patches.mkdir(parents=True)
+        (patches / self.config.get_susfs_patch_filename()).write_text("".join(patch_contents["susfs-maps.patch"]))
+        self.builder.sukisu_patch_dir.mkdir()
+        (self.builder.sukisu_patch_dir / "69_hide_stuff.patch").write_text("".join(patch_contents["hide-maps.patch"]))
+        self.builder.apply_kernel_patches()
+        source = maps.read_text()
+        self.assertRegex(source, r"if \(spoofed_redirected_name\)\s+seq_puts\(m, spoofed_redirected_name\);")
+        redirect = source.index("if (SUSFS_IS_INODE_OPEN_REDIRECT(inode))")
+        redirect_end = source.index("#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT", redirect)
+        self.assertGreater(source.index("dentry = file->f_path.dentry;"), redirect_end)
+        self.assertIn('strstr(path, "jit-zygote-cache")', source)
+        self.assertIn("srcu_read_unlock(&susfs_srcu_open_redirect, srcu_idx);", source)
+        # The real build failed with OPEN_REDIRECT disabled: the misplaced
+        # dentry use/goto disappeared, leaving -Werror unused-variable/label.
+        without_includes = "\n".join(line for line in source.splitlines()
+                                     if not line.lstrip().startswith("#include"))
+        preprocessed = subprocess.run(["gcc", "-E", "-P", "-x", "c", "-"],
+                                      input=without_includes, text=True, check=True,
+                                      capture_output=True).stdout
+        self.assertNotIn("SUSFS_IS_INODE_OPEN_REDIRECT(inode)", preprocessed)
+        self.assertIn("dentry = file->f_path.dentry;", preprocessed)
+        self.assertIn("goto bypass;", preprocessed)
 
     def test_stable_and_dev_select_supported_installer_revisions(self):
         for version, expected in ((config.KSUVersion.STABLE.value, []),

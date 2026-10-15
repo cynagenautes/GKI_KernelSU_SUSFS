@@ -308,26 +308,39 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         if not susfs_patch.is_file():
             raise FileNotFoundError(f"Required SUSFS patch is missing: {susfs_patch}")
         if susfs_patch.exists():
-            self._run_cmd(f"cp {susfs_patch} {common_dir}/")
+            self._run_cmd(f"cp {shlex.quote(str(susfs_patch))} {shlex.quote(str(common_dir))}/")
         for src, dst in [
             (self.susfs_dir / "kernel_patches/fs", common_dir / "fs/"),
             (self.susfs_dir / "kernel_patches/include/linux", common_dir / "include/linux/"),
         ]:
             if src.exists():
-                self._run_cmd(f"cp -r {src}/* {dst}")
+                self._run_cmd(f"cp -r {shlex.quote(str(src))}/* {shlex.quote(str(dst))}")
         if susfs_patch.exists():
             patch_file = common_dir / self.config.get_susfs_patch_filename()
             if patch_file.exists():
                 self._chdir(common_dir)
-                self._run_cmd(f"patch -p1 --fuzz=3 < {patch_file}")
+                self._run_cmd(f"patch -p1 --fuzz=3 < {shlex.quote(str(patch_file))}")
                 self._chdir(self.work_dir)
+
+    def apply_kernel_patches(self):
+        susfs_patch = self.susfs_dir / "kernel_patches" / self.config.get_susfs_patch_filename()
+        # SUSFS's SRCU redirect path adds another pgoff assignment. Applying the
+        # old maps patch afterwards with fuzz=3 matches that inner assignment,
+        # splitting the redirect conditional and allowing jumps past its unlock.
+        # Patch the original mapping path first for this SUSFS implementation.
+        modern_redirect = "susfs_open_redirect_spoof_show_map_vma_srcu" in susfs_patch.read_text()
+        if modern_redirect:
+            self.apply_sukisu_patches()
+        self.apply_susfs_patches()
+        if not modern_redirect:
+            self.apply_sukisu_patches()
 
     def apply_sukisu_patches(self):
         logger.info("=== 应用 SukiSU 补丁 ===")
         self._chdir(self.work_dir / "common")
         hooks_patch = self.sukisu_patch_dir / "69_hide_stuff.patch"
         if hooks_patch.exists():
-            self._run_cmd(f"cp {hooks_patch} . && patch -p1 -F 3 < 69_hide_stuff.patch")
+            self._run_cmd(f"cp {shlex.quote(str(hooks_patch))} . && patch -p1 -F 3 < 69_hide_stuff.patch")
 
     def apply_zram_patches(self):
         if not self.config.use_zram:
@@ -796,8 +809,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             self.add_kernel_supatch()
             self.add_kernelsu()
             self.add_bbg()
-            self.apply_susfs_patches()
-            self.apply_sukisu_patches()
+            self.apply_kernel_patches()
             self.apply_zram_patches()
             self.apply_task_mmu_fixes()
             self.configure_kernel()
